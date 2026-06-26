@@ -1,7 +1,7 @@
 package tmplfuncs
 
 import (
-	"fmt"
+	"errors"
 	"strings"
 	"testing"
 	"text/template"
@@ -53,6 +53,31 @@ func TestFuncMap(t *testing.T) {
 		require.PanicsWithValue(t, `unknown template helper "missing"`, func() {
 			_ = FuncMap(Helper("missing"))
 		})
+	})
+}
+
+func TestFuncMapE(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns selected helpers", func(t *testing.T) {
+		t.Parallel()
+
+		funcs, err := FuncMapE(JSON, Optional)
+
+		require.NoError(t, err)
+		assert.Len(t, funcs, 2)
+		assert.Contains(t, funcs, "json")
+		assert.Contains(t, funcs, "optional")
+	})
+
+	t.Run("returns error for unknown helpers", func(t *testing.T) {
+		t.Parallel()
+
+		funcs, err := FuncMapE(Helper("missing"))
+
+		require.Error(t, err)
+		assert.Nil(t, funcs)
+		assert.EqualError(t, err, `unknown template helper "missing"`)
 	})
 }
 
@@ -128,42 +153,58 @@ func TestWhenValue(t *testing.T) {
 
 	assert.Equal(t, "yes", WhenValue(true, "yes", "no"))
 	assert.Equal(t, "no", WhenValue(false, "yes", "no"))
+	assert.Equal(t, "yes", WhenValue("value", "yes", "no"))
+	assert.Equal(t, "no", WhenValue("", "yes", "no"))
+	assert.Equal(t, "yes", WhenValue(1, "yes", "no"))
+	assert.Equal(t, "no", WhenValue(0, "yes", "no"))
+	assert.Equal(t, "yes", WhenValue([]string{"value"}, "yes", "no"))
+	assert.Equal(t, "no", WhenValue([]string{}, "yes", "no"))
+	assert.Equal(t, 1, WhenValue(true, 1, 2))
 }
 
 func TestDefaultValue(t *testing.T) {
 	t.Parallel()
 
-	t.Run("returns fallback for zero values", func(t *testing.T) {
+	t.Run("returns fallback for empty values", func(t *testing.T) {
 		t.Parallel()
 
 		assert.Equal(t, "fallback", DefaultValue("fallback", ""))
 		assert.Equal(t, "fallback", DefaultValue("fallback", 0))
 		assert.Equal(t, "fallback", DefaultValue("fallback", false))
+		assert.Equal(t, "fallback", DefaultValue("fallback", []string{}))
+		assert.Equal(t, "fallback", DefaultValue("fallback", map[string]string{}))
+		assert.Equal(t, "fallback", DefaultValue("fallback", time.Time{}))
 	})
 
-	t.Run("returns non zero values", func(t *testing.T) {
+	t.Run("returns non-empty values", func(t *testing.T) {
 		t.Parallel()
 
 		assert.Equal(t, "value", DefaultValue("fallback", "value"))
 		assert.Equal(t, 42, DefaultValue("fallback", 42))
 		assert.Equal(t, true, DefaultValue("fallback", true))
+		assert.Equal(t, []string{"value"}, DefaultValue("fallback", []string{"value"}))
 	})
 }
 
 func TestCoalesceValue(t *testing.T) {
 	t.Parallel()
 
-	assert.Equal(t, "platform", CoalesceValue("", 0, "platform", "fallback"))
+	assert.Equal(t, "platform", CoalesceValue("", 0, []string{}, map[string]string{}, "platform", "fallback"))
 	assert.Equal(t, "fallback", CoalesceValue(nil, false, "fallback"))
-	assert.Nil(t, CoalesceValue("", 0, false, nil))
+	assert.Nil(t, CoalesceValue("", 0, false, nil, []string{}, map[string]string{}))
 }
 
 func TestOptionalValue(t *testing.T) {
 	t.Parallel()
 
 	assert.Equal(t, "Status URL: https://example.test/status", OptionalValue("Status URL: %s", " https://example.test/status "))
+	assert.Equal(t, "Label: value", OptionalValue("%s: %s", " Label ", " value "))
 	assert.Empty(t, OptionalValue("Status URL: %s", ""))
+	assert.Empty(t, OptionalValue("Status URL: %s", "   "))
 	assert.Empty(t, OptionalValue("Status URL: %s", nil))
+	assert.Empty(t, OptionalValue("%s: %s", "Label", ""))
+	assert.Empty(t, OptionalValue(""))
+	assert.Empty(t, OptionalValue("Status URL: %s"))
 }
 
 func TestFormatTimeValue(t *testing.T) {
@@ -202,6 +243,15 @@ func TestFormatTimeValue(t *testing.T) {
 		assert.Equal(t, "2026-06-24 12:00:00 UTC", got)
 	})
 
+	t.Run("rejects empty time string", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := FormatTimeValue(time.RFC3339, "")
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "time value must not be empty")
+	})
+
 	t.Run("rejects invalid time string", func(t *testing.T) {
 		t.Parallel()
 
@@ -236,10 +286,10 @@ func TestStringHelpers(t *testing.T) {
 	t.Parallel()
 
 	assert.Equal(t, "value", TrimValue(" value\n"))
+	assert.Equal(t, "42", TrimValue(42))
 	assert.Equal(t, "PROMETHEUS", UpperValue("prometheus"))
 	assert.Equal(t, "prometheus", LowerValue("PROMETHEUS"))
-	assert.Equal(t, "42", StringValue(42))
-	assert.Empty(t, StringValue(nil))
+	assert.Empty(t, TrimValue(nil))
 }
 
 func TestWithPrefixValue(t *testing.T) {
@@ -294,6 +344,15 @@ func TestDurationValue(t *testing.T) {
 		assert.Equal(t, "1m30s", got)
 	})
 
+	t.Run("rejects empty duration string", func(t *testing.T) {
+		t.Parallel()
+
+		_, err := DurationValue("")
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "duration value must not be empty")
+	})
+
 	t.Run("rejects invalid duration", func(t *testing.T) {
 		t.Parallel()
 
@@ -324,34 +383,82 @@ func TestDurationValue(t *testing.T) {
 	})
 }
 
-func TestIsZeroValue(t *testing.T) {
+func TestIsTruthyValue(t *testing.T) {
 	t.Parallel()
 
-	t.Run("detects zero values", func(t *testing.T) {
+	t.Run("detects falsey values", func(t *testing.T) {
 		t.Parallel()
 
 		var ptr *string
+		empty := ""
 
-		assert.True(t, IsZeroValue(nil))
-		assert.True(t, IsZeroValue(ptr))
-		assert.True(t, IsZeroValue(""))
-		assert.True(t, IsZeroValue(0))
-		assert.True(t, IsZeroValue(false))
-		assert.True(t, IsZeroValue(time.Time{}))
-		assert.True(t, IsZeroValue([]string(nil)))
+		assert.False(t, isTruthyValue(nil))
+		assert.False(t, isTruthyValue(ptr))
+		assert.False(t, isTruthyValue(""))
+		assert.False(t, isTruthyValue(&empty))
+		assert.False(t, isTruthyValue(0))
+		assert.False(t, isTruthyValue(false))
+		assert.False(t, isTruthyValue([]string(nil)))
+		assert.False(t, isTruthyValue([]string{}))
+		assert.False(t, isTruthyValue(map[string]string{}))
 	})
 
-	t.Run("detects non zero values", func(t *testing.T) {
+	t.Run("detects truthy values", func(t *testing.T) {
 		t.Parallel()
 
 		text := "value"
 
-		assert.False(t, IsZeroValue(&text))
-		assert.False(t, IsZeroValue("value"))
-		assert.False(t, IsZeroValue(1))
-		assert.False(t, IsZeroValue(true))
-		assert.False(t, IsZeroValue(time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)))
+		assert.True(t, isTruthyValue(&text))
+		assert.True(t, isTruthyValue("value"))
+		assert.True(t, isTruthyValue(1))
+		assert.True(t, isTruthyValue(true))
+		assert.True(t, isTruthyValue([]string{"value"}))
+		assert.True(t, isTruthyValue(map[string]string{"key": "value"}))
+		assert.True(t, isTruthyValue(time.Time{}))
 	})
+}
+
+func TestIsEmptyValue(t *testing.T) {
+	t.Parallel()
+
+	t.Run("detects empty values", func(t *testing.T) {
+		t.Parallel()
+
+		var ptr *string
+
+		assert.True(t, isEmptyValue(nil))
+		assert.True(t, isEmptyValue(ptr))
+		assert.True(t, isEmptyValue(""))
+		assert.True(t, isEmptyValue(0))
+		assert.True(t, isEmptyValue(false))
+		assert.True(t, isEmptyValue(time.Time{}))
+		assert.True(t, isEmptyValue([]string(nil)))
+		assert.True(t, isEmptyValue([]string{}))
+		assert.True(t, isEmptyValue(map[string]string{}))
+	})
+
+	t.Run("detects non-empty values", func(t *testing.T) {
+		t.Parallel()
+
+		empty := ""
+		text := "value"
+
+		assert.False(t, isEmptyValue(&empty))
+		assert.False(t, isEmptyValue(&text))
+		assert.False(t, isEmptyValue("value"))
+		assert.False(t, isEmptyValue(1))
+		assert.False(t, isEmptyValue(true))
+		assert.False(t, isEmptyValue(time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)))
+		assert.False(t, isEmptyValue([]string{"value"}))
+		assert.False(t, isEmptyValue(map[string]string{"key": "value"}))
+	})
+}
+
+func TestStringValue(t *testing.T) {
+	t.Parallel()
+
+	assert.Equal(t, "42", stringValue(42))
+	assert.Empty(t, stringValue(nil))
 }
 
 func TestTimeValue(t *testing.T) {
@@ -428,7 +535,7 @@ func TestDurationValueInternal(t *testing.T) {
 	t.Run("rejects unsupported value", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := durationValue(fmt.Errorf("unsupported"))
+		_, err := durationValue(errors.New("unsupported"))
 
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "got *errors.errorString")

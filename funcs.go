@@ -1,4 +1,7 @@
 // Package tmplfuncs provides small, reusable helper functions for Go templates.
+//
+// The helpers are designed for use with text/template and html/template. They
+// are pipeline-friendly where that makes templates easier to read.
 package tmplfuncs
 
 import (
@@ -20,16 +23,16 @@ const (
 	// JSON registers json, which renders a value as a JSON literal.
 	JSON Helper = "json"
 
-	// When registers when, which returns one of two strings based on a boolean condition.
+	// When registers when, which returns one of two values based on template truthiness.
 	When Helper = "when"
 
-	// Default registers default, which returns a fallback for empty or zero values.
+	// Default registers default, which returns a fallback for empty values.
 	Default Helper = "default"
 
-	// Coalesce registers coalesce, which returns the first non-empty, non-zero value.
+	// Coalesce registers coalesce, which returns the first non-empty value.
 	Coalesce Helper = "coalesce"
 
-	// Optional registers optional, which renders formatted text only when a value is set.
+	// Optional registers optional, which formats text only when all values are non-empty.
 	Optional Helper = "optional"
 
 	// FormatTime registers formatTime, which formats a time value with a Go layout.
@@ -97,9 +100,26 @@ var helperDefinitions = map[Helper]helperDefinition{
 // FuncMap returns a template.FuncMap containing the selected helpers.
 //
 // When called without arguments, FuncMap returns all helpers. When called with
-// helpers, it returns only those helpers. FuncMap panics for unknown helper
-// identifiers because invalid helper constants are programming errors.
+// helpers, it returns only those helpers.
+//
+// FuncMap panics for unknown helper identifiers because invalid helper
+// identifiers are programming errors. Use FuncMapE when helper identifiers come
+// from dynamic input.
 func FuncMap(helpers ...Helper) template.FuncMap {
+	funcs, err := FuncMapE(helpers...)
+	if err != nil {
+		panic(err)
+	}
+	return funcs
+}
+
+// FuncMapE returns a template.FuncMap containing the selected helpers.
+//
+// When called without arguments, FuncMapE returns all helpers. When called with
+// helpers, it returns only those helpers.
+//
+// FuncMapE returns an error for unknown helper identifiers.
+func FuncMapE(helpers ...Helper) (template.FuncMap, error) {
 	if len(helpers) == 0 {
 		helpers = All()
 	}
@@ -108,15 +128,20 @@ func FuncMap(helpers ...Helper) template.FuncMap {
 	for _, helper := range helpers {
 		definition, ok := helperDefinitions[helper]
 		if !ok {
-			panic(fmt.Sprintf("unknown template helper %q", helper))
+			return nil, fmt.Errorf("unknown template helper %q", helper)
 		}
 		funcs[definition.name] = definition.fn
 	}
 
-	return funcs
+	return funcs, nil
 }
 
-// JSONValue renders any template value as a JSON literal.
+// JSONValue renders value as a JSON literal.
+//
+// This is useful when embedding dynamic strings, maps, slices, or structs in
+// JSON templates.
+//
+//	"text": {{ .Subject | json }}
 func JSONValue(value any) (string, error) {
 	body, err := json.Marshal(value)
 	if err != nil {
@@ -125,63 +150,90 @@ func JSONValue(value any) (string, error) {
 	return string(body), nil
 }
 
-// WhenValue returns trueValue when condition is true and falseValue otherwise.
+// WhenValue returns trueValue when condition is truthy, otherwise falseValue.
 //
-// The argument order favors natural inline conditional usage:
+// Truthiness follows template-style rules: nil, false, zero numbers, empty
+// strings, empty arrays, empty maps, empty slices, empty channels, and nil
+// pointers/interfaces are false. Other values are true.
+//
+// The helper accepts any value type so it can be used with booleans, strings,
+// numbers, slices, maps, and pointers.
 //
 //	{{ when .Resolved "Resolved at" "Notified at" }}
-func WhenValue(condition bool, trueValue, falseValue string) string {
-	if condition {
+//	{{ when .Status "has status" "missing status" }}
+func WhenValue(condition, trueValue, falseValue any) any {
+	if isTruthyValue(condition) {
 		return trueValue
 	}
 	return falseValue
 }
 
-// DefaultValue returns fallback when value is empty or the zero value.
+// DefaultValue returns fallback when value is empty.
+//
+// Empty follows the same rules as template helpers: nil, false, zero numbers,
+// empty strings, empty arrays, empty maps, empty slices, empty channels, nil
+// pointers/interfaces, and other Go zero values are empty.
 //
 // The argument order supports both direct and pipeline usage:
 //
 //	{{ default "fallback" .Value }}
 //	{{ .Value | default "fallback" }}
 func DefaultValue(fallback, value any) any {
-	if IsZeroValue(value) {
+	if isEmptyValue(value) {
 		return fallback
 	}
 	return value
 }
 
-// CoalesceValue returns the first value that is not empty or the zero value.
+// CoalesceValue returns the first non-empty value.
+//
+// Empty follows the same rules as DefaultValue.
+//
+//	{{ coalesce .Title .Name "unknown" }}
 func CoalesceValue(values ...any) any {
 	for _, value := range values {
-		if !IsZeroValue(value) {
+		if !isEmptyValue(value) {
 			return value
 		}
 	}
 	return nil
 }
 
-// OptionalValue returns formatted text when value is not empty.
+// OptionalValue formats text only when all values are non-empty.
 //
-// The argument order supports both direct and pipeline usage:
+// Empty follows the same rules as DefaultValue. Values are converted to strings
+// and trimmed before formatting, so whitespace-only values are treated as empty.
+//
+// The argument order supports direct and pipeline usage:
 //
 //	{{ optional "Status URL: %s" .App.StatusURL }}
+//	{{ optional "%s: %s" .Label .Value }}
 //	{{ .App.StatusURL | optional "Status URL: %s" }}
-func OptionalValue(format string, value any) string {
-	if IsZeroValue(value) {
+func OptionalValue(format string, values ...any) string {
+	if format == "" || len(values) == 0 {
 		return ""
 	}
 
-	text := strings.TrimSpace(StringValue(value))
-	if text == "" {
-		return ""
+	args := make([]any, 0, len(values))
+	for _, value := range values {
+		if isEmptyValue(value) {
+			return ""
+		}
+
+		text := strings.TrimSpace(stringValue(value))
+		if text == "" {
+			return ""
+		}
+
+		args = append(args, text)
 	}
 
-	return fmt.Sprintf(format, text)
+	return fmt.Sprintf(format, args...)
 }
 
 // FormatTimeValue formats a time value with layout.
 //
-// The value may be a time.Time, *time.Time, or an RFC3339/RFC3339Nano string.
+// The value may be time.Time, *time.Time, or an RFC3339/RFC3339Nano string.
 // The argument order supports both direct and pipeline usage:
 //
 //	{{ formatTime "2006-01-02 15:04:05 MST" .ExpectedBy }}
@@ -195,32 +247,35 @@ func FormatTimeValue(layout string, value any) (string, error) {
 }
 
 // TrimValue returns value as a string with surrounding whitespace removed.
+//
+//	{{ .Name | trim }}
 func TrimValue(value any) string {
-	return strings.TrimSpace(StringValue(value))
+	return strings.TrimSpace(stringValue(value))
 }
 
 // UpperValue returns value as an uppercase string.
+//
+//	{{ .Status | upper }}
 func UpperValue(value any) string {
-	return strings.ToUpper(StringValue(value))
+	return strings.ToUpper(stringValue(value))
 }
 
 // LowerValue returns value as a lowercase string.
+//
+//	{{ .Status | lower }}
 func LowerValue(value any) string {
-	return strings.ToLower(StringValue(value))
+	return strings.ToLower(stringValue(value))
 }
 
 // WithPrefixValue returns value with prefix prepended when it is not already present.
 //
-// The argument order supports both direct and pipeline usage:
+// The value and prefix are trimmed before comparison. The argument order
+// supports both direct and pipeline usage:
 //
 //	{{ withPrefix "#" .CustomData.channel }}
 //	{{ .CustomData.channel | withPrefix "#" }}
 func WithPrefixValue(prefix string, value any) string {
-	if value == nil {
-		return ""
-	}
-
-	text := strings.TrimSpace(fmt.Sprint(value))
+	text := strings.TrimSpace(stringValue(value))
 	prefix = strings.TrimSpace(prefix)
 
 	if text == "" || prefix == "" || strings.HasPrefix(text, prefix) {
@@ -232,16 +287,13 @@ func WithPrefixValue(prefix string, value any) string {
 
 // WithSuffixValue returns value with suffix appended when it is not already present.
 //
-// The argument order supports both direct and pipeline usage:
+// The value and suffix are trimmed before comparison. The argument order
+// supports both direct and pipeline usage:
 //
-//	{{ withSuffix "/" .CustomData.path }}
-//	{{ .CustomData.path | withSuffix "/" }}
+//	{{ withSuffix "/" .Path }}
+//	{{ .Path | withSuffix "/" }}
 func WithSuffixValue(suffix string, value any) string {
-	if value == nil {
-		return ""
-	}
-
-	text := strings.TrimSpace(fmt.Sprint(value))
+	text := strings.TrimSpace(stringValue(value))
 	suffix = strings.TrimSpace(suffix)
 
 	if text == "" || suffix == "" || strings.HasSuffix(text, suffix) {
@@ -253,8 +305,10 @@ func WithSuffixValue(suffix string, value any) string {
 
 // DurationValue renders a duration value as a Go duration string.
 //
-// The value may be a time.Duration, *time.Duration, or a string accepted by
+// The value may be time.Duration, *time.Duration, or a string accepted by
 // time.ParseDuration.
+//
+//	{{ .AlertingDelay | duration }}
 func DurationValue(value any) (string, error) {
 	d, err := durationValue(value)
 	if err != nil {
@@ -263,8 +317,37 @@ func DurationValue(value any) (string, error) {
 	return d.String(), nil
 }
 
-// IsZeroValue reports whether value is nil, invalid, or the zero value for its type.
-func IsZeroValue(value any) bool {
+// isTruthyValue reports whether value should be treated as true in template helpers.
+func isTruthyValue(value any) bool {
+	if value == nil {
+		return false
+	}
+
+	v := reflect.ValueOf(value)
+	if !v.IsValid() {
+		return false
+	}
+
+	switch v.Kind() {
+	case reflect.Bool:
+		return v.Bool()
+	case reflect.String, reflect.Array, reflect.Chan, reflect.Map, reflect.Slice:
+		return v.Len() > 0
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() != 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint() != 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() != 0
+	case reflect.Interface, reflect.Pointer:
+		return !v.IsNil() && isTruthyValue(v.Elem().Interface())
+	default:
+		return true
+	}
+}
+
+// isEmptyValue reports whether value should be treated as empty in template helpers.
+func isEmptyValue(value any) bool {
 	if value == nil {
 		return true
 	}
@@ -275,23 +358,34 @@ func IsZeroValue(value any) bool {
 	}
 
 	switch v.Kind() {
-	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
-		if v.IsNil() {
-			return true
-		}
+	case reflect.Bool:
+		return !v.Bool()
+	case reflect.String, reflect.Array, reflect.Chan, reflect.Map, reflect.Slice:
+		return v.Len() == 0
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return v.Int() == 0
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		return v.Uint() == 0
+	case reflect.Float32, reflect.Float64:
+		return v.Float() == 0
+	case reflect.Interface, reflect.Pointer:
+		return v.IsNil()
+	default:
+		return v.IsZero()
 	}
-
-	return v.IsZero()
 }
 
-// StringValue converts a template value to a string.
-func StringValue(value any) string {
+// stringValue converts a template value to a string.
+//
+// Nil values render as an empty string.
+func stringValue(value any) string {
 	if value == nil {
 		return ""
 	}
 	return fmt.Sprint(value)
 }
 
+// timeValue converts supported template inputs into a time.Time.
 func timeValue(value any) (time.Time, error) {
 	switch v := value.(type) {
 	case time.Time:
@@ -302,7 +396,12 @@ func timeValue(value any) (time.Time, error) {
 		}
 		return *v, nil
 	case string:
-		t, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(v))
+		text := strings.TrimSpace(v)
+		if text == "" {
+			return time.Time{}, fmt.Errorf("time value must not be empty")
+		}
+
+		t, err := time.Parse(time.RFC3339Nano, text)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("parse time %q: %w", v, err)
 		}
@@ -323,7 +422,12 @@ func durationValue(value any) (time.Duration, error) {
 		}
 		return *v, nil
 	case string:
-		d, err := time.ParseDuration(strings.TrimSpace(v))
+		text := strings.TrimSpace(v)
+		if text == "" {
+			return 0, fmt.Errorf("duration value must not be empty")
+		}
+
+		d, err := time.ParseDuration(text)
 		if err != nil {
 			return 0, fmt.Errorf("parse duration %q: %w", v, err)
 		}
